@@ -1,5 +1,4 @@
 import random
-
 from sc2 import maps
 from sc2.bot_ai import BotAI
 from sc2.data import Race, Difficulty
@@ -9,32 +8,76 @@ from sc2.main import run_game
 from sc2.player import Bot, Computer
 
 
-class WorkerRushBot(BotAI):
+class StarCraftBot(BotAI):
     def __init__(self):
         super().__init__()
+
         self.last_expansion_attempt = -999
+        self.EXPANSION_LIMIT = 3  # Max number of expansions
+        self.MINERALS_FOR_EXPANSION = 400  # Amount of minerals to be saved for expansion
+        self.EXPANSION_COOLDOWN = 100  # Cooldown (game steps) between expansions to avoid over-expanding
 
     async def on_step(self, iteration: int):
         if iteration == 0:
             await self.send_initial_scout()
 
-        defending = await self.defend()
+        # Try to defend if under attack, otherwise proceed with normal strategy
+        if not await self.defend():
+            # Regular strategy execution
+            await self.manage_economy()
+            await self.manage_army()
+            await self.attacking_strategy()
 
-        if not defending:
-            await self.attack()
-            await self.distribute_workers()
-            await self.build_workers()
-            await self.build_supply_depots()
-            await self.smart_expand()
-            await self.build_refinery()
-            await self.offensive_force_buildings()
-            await self.build_techlab()
-            await self.build_advanced_units()
-            await self.build_offensive_force()
-            await self.build_engineering_bay()
-            await self.upgrade_units()
-            await self.build_defensive_structures()
+        await self.build_offensive_force()
 
+        # Method to manage economic development such as building workers and expanding
+
+    async def manage_economy(self):
+        await self.distribute_workers()
+        await self.build_workers()
+        await self.manage_expansion()
+        await self.build_supply_depots()
+        await self.build_refinery()
+        await self.build_engineering_bay()
+        await self.build_defensive_structures()
+        await self.build_techlab()
+
+    # Method to manage army building and tech progression
+    async def manage_army(self):
+        await self.manage_production_buildings()
+        await self.upgrade_units()
+
+    # Method to manage attacks and army movement
+    async def attacking_strategy(self):
+        attack_force_size = 36
+        offensive_units = {UnitTypeId.MARINE,
+                           UnitTypeId.REAPER,
+                           UnitTypeId.MARAUDER,
+                           UnitTypeId.MEDIVAC,
+                           UnitTypeId.BANSHEE,
+                           UnitTypeId.SIEGETANK}
+        total_offensive_units = sum(self.units(unit_type).amount for unit_type in offensive_units)
+
+        if total_offensive_units >= attack_force_size:
+            target = self.find_target()
+            for unit_type in offensive_units:
+                for unit in self.units(unit_type).idle:
+                    unit.attack(target)
+
+    def find_target(self):
+        if self.enemy_units:
+            return random.choice(self.enemy_units)
+        elif self.enemy_structures:
+            return random.choice(self.enemy_structures)
+        else:
+            return self.enemy_start_locations[0]
+
+    # Send out the initial scout worker at the start of the game
+    async def send_initial_scout(self):
+        worker = self.workers.random
+        worker.move(self.enemy_start_locations[0])
+
+    # SCV production across all command centers
     async def build_workers(self):
         early_game_scv_limit = 22
         mid_game_scv_limit = 40
@@ -53,8 +96,9 @@ class WorkerRushBot(BotAI):
                 if self.can_afford(UnitTypeId.SCV):
                     cc.train(UnitTypeId.SCV)
 
+    # Ensure we are not supply capped by building supply depots
     async def build_supply_depots(self):
-        if self.supply_left < 5 and not self.already_pending(UnitTypeId.SUPPLYDEPOT):
+        if self.supply_left < 7 and not self.already_pending(UnitTypeId.SUPPLYDEPOT):
             ccs = self.townhalls.ready
             if ccs.exists and self.can_afford(UnitTypeId.SUPPLYDEPOT):
                 location = await self.find_placement(
@@ -62,90 +106,122 @@ class WorkerRushBot(BotAI):
                     max_distance=20, random_alternative=False, placement_step=2
                 )
                 if location:
-                    await self.build(UnitTypeId.SUPPLYDEPOT, near=location)
+                    await self.build_building_near(UnitTypeId.SUPPLYDEPOT, location)
 
-    async def smart_expand(self):
-        if self.time - self.last_expansion_attempt > 10:
-            if self.townhalls.amount < 5 and self.can_afford(UnitTypeId.COMMANDCENTER):
-                location = await self.get_next_expansion()
-                if location:
-                    enemies_nearby = self.enemy_units.closer_than(20, location)
-                    if not enemies_nearby.exists:
-                        await self.expand_now()
-                        self.last_expansion_attempt = self.time
-                    else:
-                        self.last_expansion_attempt = self.time
+    # Logic for expanding to a new base
+    async def manage_expansion(self):
+        if self.townhalls.ready.amount < self.EXPANSION_LIMIT:
+            # Check if we have saved enough minerals for an expansion
+            if self.minerals > self.MINERALS_FOR_EXPANSION:
+                # Check if we're not on cooldown from the last attempted expansion
+                if self.time - self.last_expansion_attempt > self.EXPANSION_COOLDOWN:
+                    # Find the location for the next expansion
+                    location = await self.get_next_expansion()
+                    # Ensure that there are no nearby enemies before trying to expand
+                    if location and not self.enemy_units.closer_than(10, location).exists:
+                        err = await self.expand_now()
+                        if not err:
+                            self.last_expansion_attempt = self.time
 
+    # Building refineries at each base to collect vespene gas
     async def build_refinery(self):
         for cc in self.townhalls.ready:
-            vaspenes = self.vespene_geyser.closer_than(25.0, cc)
-            for vaspene in vaspenes:
-                if not self.can_afford(UnitTypeId.REFINERY) or self.already_pending(UnitTypeId.REFINERY):
-                    break
-                worker = self.select_build_worker(vaspene.position)
-                if worker is None or self.units(UnitTypeId.REFINERY).closer_than(1.0, vaspene).exists:
-                    continue
-                worker.build(UnitTypeId.REFINERY, vaspene)
+            # Find all Vespenes within a reasonable distance to our ready TownHalls
+            vespenes = self.vespene_geyser.closer_than(10, cc)
+            for vespene in vespenes:
+                # Check if we don't have a refinery and we're not already building a refinery here
+                if not self.gas_buildings.closer_than(1.0, vespene).exists and self.already_pending(
+                        UnitTypeId.REFINERY) == 0:
+                    if self.can_afford(UnitTypeId.REFINERY):
+                        await self.build(UnitTypeId.REFINERY, vespene)
 
-    async def offensive_force_buildings(self):
-        max_factories = 2
+            # Make sure we don't build excess Refineries
+        if self.gas_buildings.amount < self.townhalls.ready.amount * 2:
+            for cc in self.townhalls.ready:
+                # Find the closest Vespene Geyser without an active Refinery
+                vespene = self.vespene_geyser.closest_to(cc)
+                if self.can_afford(UnitTypeId.REFINERY) and not self.gas_buildings.closer_than(1.0, vespene).exists:
+                    await self.build(UnitTypeId.REFINERY, vespene)
+
+    # Create and manage production buildings
+    async def manage_production_buildings(self):
+        max_factories = 4
 
         if self.structures(UnitTypeId.SUPPLYDEPOT).ready.exists:
-            depot = self.structures(UnitTypeId.SUPPLYDEPOT).ready.random
+            # Create production buildings based on requirements for your chosen army composition
+            barracks_count = self.structures(UnitTypeId.BARRACKS).amount
+            factory_count = self.structures(UnitTypeId.FACTORY).amount
+            starport_count = self.structures(UnitTypeId.STARPORT).amount
+            armory_count = self.structures(UnitTypeId.ARMORY).amount
 
-            if not self.structures(UnitTypeId.BARRACKS).exists and self.can_afford(UnitTypeId.BARRACKS):
-                await self.build(UnitTypeId.BARRACKS, near=depot)
+            # Requirements for building production structures
+            need_more_barracks = self.can_afford(UnitTypeId.BARRACKS) and barracks_count < 3
+            need_more_factories = self.can_afford(UnitTypeId.FACTORY) and factory_count < max_factories
+            need_more_starports = self.can_afford(UnitTypeId.STARPORT) and starport_count < 2
+            need_armory = self.can_afford(
+                UnitTypeId.ARMORY) and armory_count == 0 and factory_count > 0  # Build Armory after the first Factory
 
-            if self.structures(UnitTypeId.BARRACKS).ready.exists:
-                if self.structures(UnitTypeId.FACTORY).amount < max_factories and not self.structures(
-                        UnitTypeId.FACTORY).exists and self.can_afford(UnitTypeId.FACTORY):
-                    await self.build(UnitTypeId.FACTORY, near=depot)
+            # Logic to build Barracks, Factories, Starports, and an Armory
+            if need_more_barracks:
+                await self.build_building_near(UnitTypeId.BARRACKS, self.start_location)
 
-                if not self.structures(UnitTypeId.ARMORY).exists and self.can_afford(UnitTypeId.ARMORY):
-                    await self.build(UnitTypeId.ARMORY, near=depot)
+            if need_more_factories and barracks_count > 0:  # Ensure we have a Barracks before building a Factory
+                await self.build_building_near(UnitTypeId.FACTORY, self.start_location)
 
-                if not self.structures(UnitTypeId.STARPORT).exists and self.can_afford(UnitTypeId.STARPORT):
-                    await self.build(UnitTypeId.STARPORT, near=depot)
+            if need_more_starports and factory_count > 0:  # Ensure we have a Factory before building a Starport
+                await self.build_building_near(UnitTypeId.STARPORT, self.start_location)
 
+            if need_armory:
+                await self.build_building_near(UnitTypeId.ARMORY, self.start_location)
+
+    # Produce combat units from available barracks
     async def build_offensive_force(self):
-        # Improved offensive force method to produce a more balanced army composition
-        if self.supply_left > 0 and self.structures(UnitTypeId.BARRACKS).ready.exists:
-            # if early game, prioritize Marines and Reapers for harassment
-            if self.minutes_passed < 5:
-                # Create Reapers if we have less than 4
-                if self.units(UnitTypeId.REAPER).amount < 4 and self.can_afford(UnitTypeId.REAPER):
-                    self.train(UnitTypeId.REAPER, 1)
-                # Fill the rest with Marines
-                elif self.can_afford(UnitTypeId.MARINE):
-                    self.train(UnitTypeId.MARINE, 5)
-            else:
-                # Mid to late game, prioritize a mix of Marines, Marauders, and Medivacs
-                if self.units(UnitTypeId.MARAUDER).amount < 8 and self.can_afford(UnitTypeId.MARAUDER):
-                    self.train(UnitTypeId.MARAUDER, 1)
-                elif self.can_afford(UnitTypeId.MARINE):
-                    self.train(UnitTypeId.MARINE, 5)
-                elif self.units(UnitTypeId.MEDIVAC).amount < 3 and self.can_afford(UnitTypeId.MEDIVAC):
-                    self.train(UnitTypeId.MEDIVAC, 1)
+        # Logic to determine the number of each type of unit to have at different stages of the game
+        marine_count_target = 20
+        marauder_count_target = 8
+        medivac_count_target = 4
+        banshee_count_target = 2
+        reaper_count_target = 4 if self.minutes_passed < 5 else 0
+        siege_tank_count_target = 5
 
-    def find_target(self):
-        if self.enemy_units:
-            return random.choice(self.enemy_units)
-        elif self.enemy_structures:
-            return random.choice(self.enemy_structures)
-        else:
-            return self.enemy_start_locations[0]
+        # Check if we have the required buildings before training units
+        barracks_ready = self.structures(UnitTypeId.BARRACKS).ready.exists
+        factory_ready = self.structures(UnitTypeId.FACTORY).ready.exists
+        starport_ready = self.structures(UnitTypeId.STARPORT).ready.exists
 
-    async def attack(self):
-        attack_force_size = 24
-        offensive_units = {UnitTypeId.MARINE, UnitTypeId.REAPER, UnitTypeId.MARAUDER}
-        total_offensive_units = sum(self.units(unit_type).amount for unit_type in offensive_units)
+        # Training logic for each unit type based on available buildings and resources
+        if barracks_ready:
+            for rax in self.structures(UnitTypeId.BARRACKS).ready.idle:
+                if self.can_afford(UnitTypeId.MARINE) and self.units(UnitTypeId.MARINE).amount < marine_count_target:
+                    rax.train(UnitTypeId.MARINE)
 
-        if total_offensive_units >= attack_force_size:
-            target = self.find_target()
-            for unit_type in offensive_units:
-                for unit in self.units(unit_type).idle:
-                    unit.attack(target)
+                # Include a check to see if a Tech Lab is attached for Marauders and if we've hit our target count
+                elif self.can_afford(UnitTypeId.MARAUDER) and rax.has_add_on and self.units(
+                        UnitTypeId.MARAUDER).amount < marauder_count_target:
+                    rax.train(UnitTypeId.MARAUDER)
 
+                # Reaper training prioritized early game for harassment
+                if self.can_afford(UnitTypeId.REAPER) and self.units(UnitTypeId.REAPER).amount < reaper_count_target:
+                    rax.train(UnitTypeId.REAPER)
+
+        # Factory for Siege Tanks
+        if factory_ready:
+            for factory in self.structures(UnitTypeId.FACTORY).ready.idle:
+                if self.units(UnitTypeId.SIEGETANK).amount < siege_tank_count_target and self.can_afford(
+                        UnitTypeId.SIEGETANK):
+                    factory.train(UnitTypeId.SIEGETANK)
+
+        # Starport for Medivacs and Banshees
+        if starport_ready:
+            for starport in self.structures(UnitTypeId.STARPORT).ready.idle:
+                if self.units(UnitTypeId.MEDIVAC).amount < medivac_count_target and self.can_afford(UnitTypeId.MEDIVAC):
+                    starport.train(UnitTypeId.MEDIVAC)
+                # Check if techlab is attached for Banshee production
+                if starport.has_add_on and self.can_afford(UnitTypeId.BANSHEE) and self.units(
+                        UnitTypeId.BANSHEE).amount < banshee_count_target:
+                    starport.train(UnitTypeId.BANSHEE)
+
+    # Engineering bay for upgrade research
     async def upgrade_units(self):
         if self.structures(UnitTypeId.ENGINEERINGBAY).ready.exists:
             if self.units(UnitTypeId.MARINE).amount > self.units(UnitTypeId.MARAUDER).amount:
@@ -159,46 +235,42 @@ class WorkerRushBot(BotAI):
                     self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
                         UpgradeId.TERRANINFANTRYARMORSLEVEL1)
 
+    # Develop the base's technology with tech labs
     async def build_techlab(self):
-        num_ccs = self.townhalls.ready.amount
-        num_techlabs = self.structures(UnitTypeId.BARRACKSTECHLAB).ready.amount
-
-        if num_techlabs < num_ccs:
-            for rax in self.structures(UnitTypeId.BARRACKS).ready.idle:
-                if not rax.has_add_on and self.can_afford(UnitTypeId.BARRACKSTECHLAB):
+        # Check if we have enough resources to build a Tech Lab
+        if self.can_afford(UnitTypeId.BARRACKSTECHLAB):
+            # Iterate through all Barracks without a Tech Lab
+            for rax in self.structures(UnitTypeId.BARRACKS).ready:
+                if not rax.has_add_on:
+                    # Attach a Tech Lab to the Barracks
                     rax.build(UnitTypeId.BARRACKSTECHLAB)
 
-    async def build_advanced_units(self):
-        if self.structures(UnitTypeId.STARPORT).ready.exists:
-            for starport in self.structures(UnitTypeId.STARPORT).ready.idle:
-                if self.can_afford(UnitTypeId.BANSHEE):
-                    starport.train(UnitTypeId.BANSHEE)
+        # Similarly, build Tech Labs for Factories and Starports if needed
+        if self.can_afford(UnitTypeId.FACTORYTECHLAB):
+            for factory in self.structures(UnitTypeId.FACTORY).ready:
+                if not factory.has_add_on:
+                    factory.build(UnitTypeId.FACTORYTECHLAB)
 
-        if self.structures(UnitTypeId.FACTORY).ready.exists:
-            for factory in self.structures(UnitTypeId.FACTORY).ready.idle:
-                if self.can_afford(UnitTypeId.SIEGETANK):
-                    factory.train(UnitTypeId.SIEGETANK)
+        if self.can_afford(UnitTypeId.STARPORTTECHLAB):
+            for starport in self.structures(UnitTypeId.STARPORT).ready:
+                if not starport.has_add_on:
+                    starport.build(UnitTypeId.STARPORTTECHLAB)
 
-    async def defend(self):
-        for th in self.structures:
-            if self.enemy_units.closer_than(20, th.position):
-                await self.defend_base(th)
-                return True
-        return False
-
-    async def defend_base(self, location):
-        # Find the enemy units attacking our location
-        enemies = self.enemy_units.closer_than(20, location.position)
-        # If there are enemies, defend against them
-        if enemies.exists:
-            # Call all available military units to defend against the enemies
-            for unit in self.units.idle:
-                # Make each idle military unit attack the closest enemy unit
-                unit.attack(enemies.closest_to(location))
-            # Train additional units if needed
-            for rax in self.structures(UnitTypeId.BARRACKS).ready.idle:
-                if self.can_afford(UnitTypeId.MARINE):
-                    rax.train(UnitTypeId.MARINE)
+    # Use established position logic to prevent unit pathing blockage
+    async def build_building_near(self, building_type, near_structure, max_distance=20):
+        # Note that try...except blocks are used to handle the situation where the bot may be unable to find a
+        # valid build location (e.g. all locations are blocked or currently occupied).
+        try:
+            location = await self.find_placement(building_type, near_structure.position, max_distance=max_distance)
+            if location:
+                workers = self.workers.gathering
+                if workers:  # Ensure we have workers to use
+                    worker = workers.closest_to(location)
+                    worker.build(building_type, location)
+                    return True  # Successfully found a location and issued a build command
+        except Exception as e:
+            print(str(e))  # For debugging purposes, remove or handle this print as desired in production
+        return False  # Failed to find a location/build the structure
 
     async def build_engineering_bay(self):
         # Check if you already have an ENGINEERINGBAY
@@ -209,61 +281,62 @@ class WorkerRushBot(BotAI):
                 location = await self.find_placement(UnitTypeId.ENGINEERINGBAY,
                                                      near=self.start_location.towards(self.game_info.map_center, 5))
                 if location:
-                    # Use a worker to build the ENGINEERINGBAY
-                    worker = self.select_build_worker(location)
-                    if worker:
-                        worker.build(UnitTypeId.ENGINEERINGBAY, location)
+                    await self.build_building_near(UnitTypeId.ENGINEERINGBAY, location)
 
     async def build_defensive_structures(self):
-        # Ensure you have an Engineering Bay before building Missile Turrets
         if self.structures(UnitTypeId.ENGINEERINGBAY).ready.exists:
-            await self.build_missile_turrets()
+            for cc in self.townhalls.ready:
+                await self.build_missile_turrets(cc)
 
-        # Build Bunkers at key defense positions
-        await self.build_bunkers()
-
-    async def build_missile_turrets(self):
-        # Build Missile Turrets near mineral lines and important structures
         for cc in self.townhalls.ready:
-            # Check if there are enough Missile Turrets around
-            if self.structures(UnitTypeId.MISSILETURRET).closer_than(10, cc).amount < 2 and self.can_afford(
-                    UnitTypeId.MISSILETURRET):
-                # Find a proper location to build a turret
-                location = await self.find_placement(UnitTypeId.MISSILETURRET,
-                                                     cc.position.towards(self.game_info.map_center, 10))
-                if location:
-                    await self.build(UnitTypeId.MISSILETURRET, near=location)
+            await self.build_bunkers(cc)
 
-    async def build_bunkers(self):
-        limit = 5
-        bunkers = self.structures(UnitTypeId.BUNKER)
-        # Only continue if we have less than the desired number of Bunkers
-        if bunkers.amount < limit:
-            # Only build Bunkers if we have a Barracks and can afford it
-            if self.structures(UnitTypeId.BARRACKS).ready.exists and self.can_afford(UnitTypeId.BUNKER):
-                # Try to build a Bunker near the first Barracks
-                target_barracks = self.structures(UnitTypeId.BARRACKS).ready.first
-                location = await self.find_placement(UnitTypeId.BUNKER,
-                                                     near=target_barracks.position.towards(self.game_info.map_center,
-                                                                                           5))
-                if location:
-                    await self.build(UnitTypeId.BUNKER, near=location)
+    async def build_missile_turrets(self, cc):
+        if self.structures(UnitTypeId.MISSILETURRET).closer_than(10, cc).amount < 2 and self.can_afford(
+                UnitTypeId.MISSILETURRET):
+            location = await self.find_placement(UnitTypeId.MISSILETURRET,
+                                                 cc.position.towards(self.game_info.map_center, 10))
+            if location:
+                await self.build_building_near(UnitTypeId.MISSILETURRET, location)
 
+    async def build_bunkers(self, cc):
+        if self.structures(UnitTypeId.BUNKER).closer_than(10, cc).amount < 2 and self.can_afford(
+                UnitTypeId.BUNKER):
+            location = await self.find_placement(UnitTypeId.BUNKER,
+                                                 cc.position.towards(self.game_info.map_center, 10))
+            if location:
+                await self.build_building_near(UnitTypeId.BUNKER, location)
+
+    async def defend(self):
+        for th in self.townhalls:
+            enemies = self.enemy_units.closer_than(15, th.position)
+            if enemies.exists:
+                defensive_squad = self.units.idle
+                self.defend_base(th, enemies, defensive_squad)
+                return True
+        return False
+
+    def defend_base(self, location, enemies, defensive_squad):
+        if enemies.exists:
+            # If the idle defensive squad is smaller than the minimum defense squad, get more units
+            if defensive_squad.amount < 5:
+                backup_units = defensive_squad.prefer_idle.idle  # Get both idle and engaged units close to base
+                for unit in backup_units:
+                    unit.attack(enemies.closest_to(location))
+            else:
+                # Otherwise, use the idle defensive squad
+                for unit in defensive_squad:
+                    unit.attack(enemies.closest_to(location))
+
+    # Calculate elapsed game time minutes
     @property
     def minutes_passed(self):
         return self.state.game_loop / (22.4 * 60)
 
-    async def send_initial_scout(self):
-        # Sends out the initial scout worker to enemy base
-        worker = self.workers.random
-        self.do(worker.move(self.enemy_start_locations[0]))
 
-
+# Run the game
 run_game(
     maps.get("sc2-ai-cup-2022"),
-    [
-        Bot(Race.Terran, WorkerRushBot()),
-        Computer(Race.Terran, Difficulty.Easy),
-    ],
+    [Bot(Race.Terran, StarCraftBot()), Computer(Race.Terran, Difficulty.Medium)],
     realtime=False,
 )
