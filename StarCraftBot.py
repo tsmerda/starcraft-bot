@@ -27,6 +27,7 @@ class StarCraftBot(BotAI):
             await self.manage_economy()
             await self.manage_army()
             await self.attacking_strategy()
+            # await self.manage_siege_tanks()
 
         await self.build_offensive_force()
 
@@ -46,6 +47,7 @@ class StarCraftBot(BotAI):
     async def manage_army(self):
         await self.manage_production_buildings()
         await self.upgrade_units()
+        await self.upgrade_structures()
 
     # Method to manage attacks and army movement
     async def attacking_strategy(self):
@@ -146,6 +148,8 @@ class StarCraftBot(BotAI):
     # Create and manage production buildings
     async def manage_production_buildings(self):
         max_factories = 4
+        max_starports = 2
+        max_barracks = 3
 
         if self.structures(UnitTypeId.SUPPLYDEPOT).ready.exists:
             # Create production buildings based on requirements for your chosen army composition
@@ -154,10 +158,16 @@ class StarCraftBot(BotAI):
             starport_count = self.structures(UnitTypeId.STARPORT).amount
             armory_count = self.structures(UnitTypeId.ARMORY).amount
 
+            # Check if building is in progress 
+            # barracks_in_progress = self.already_pending(UnitTypeId.BARRACKS)
+            # factory_in_progress = self.already_pending(UnitTypeId.FACTORY)
+            # starport_in_progress = self.already_pending(UnitTypeId.STARPORT)
+            # armory_in_progress = self.already_pending(UnitTypeId.ARMORY)
+
             # Requirements for building production structures
-            need_more_barracks = self.can_afford(UnitTypeId.BARRACKS) and barracks_count < 3
+            need_more_barracks = self.can_afford(UnitTypeId.BARRACKS) and barracks_count < max_barracks
             need_more_factories = self.can_afford(UnitTypeId.FACTORY) and factory_count < max_factories
-            need_more_starports = self.can_afford(UnitTypeId.STARPORT) and starport_count < 2
+            need_more_starports = self.can_afford(UnitTypeId.STARPORT) and starport_count < max_starports
             need_armory = self.can_afford(
                 UnitTypeId.ARMORY) and armory_count == 0 and factory_count > 0  # Build Armory after the first Factory
 
@@ -177,8 +187,8 @@ class StarCraftBot(BotAI):
     # Produce combat units from available barracks
     async def build_offensive_force(self):
         # Logic to determine the number of each type of unit to have at different stages of the game
-        marine_count_target = 20
-        marauder_count_target = 8
+        marine_count_target = 14
+        marauder_count_target = 14
         medivac_count_target = 4
         banshee_count_target = 2
         reaper_count_target = 4 if self.minutes_passed < 5 else 0
@@ -192,16 +202,16 @@ class StarCraftBot(BotAI):
         # Training logic for each unit type based on available buildings and resources
         if barracks_ready:
             for rax in self.structures(UnitTypeId.BARRACKS).ready.idle:
-                if self.can_afford(UnitTypeId.MARINE) and self.units(UnitTypeId.MARINE).amount < marine_count_target:
+                if self.can_afford(UnitTypeId.MARINE) and self.units(UnitTypeId.MARINE).amount + self.already_pending(UnitTypeId.MARINE) < marine_count_target:
                     rax.train(UnitTypeId.MARINE)
 
                 # Include a check to see if a Tech Lab is attached for Marauders and if we've hit our target count
                 elif self.can_afford(UnitTypeId.MARAUDER) and rax.has_add_on and self.units(
-                        UnitTypeId.MARAUDER).amount < marauder_count_target:
+                        UnitTypeId.MARAUDER).amount + self.already_pending(UnitTypeId.MARAUDER) < marauder_count_target:
                     rax.train(UnitTypeId.MARAUDER)
 
                 # Reaper training prioritized early game for harassment
-                if self.can_afford(UnitTypeId.REAPER) and self.units(UnitTypeId.REAPER).amount < reaper_count_target:
+                if self.can_afford(UnitTypeId.REAPER) and self.units(UnitTypeId.REAPER).amount + self.already_pending(UnitTypeId.REAPER) < reaper_count_target:
                     rax.train(UnitTypeId.REAPER)
 
         # Factory for Siege Tanks
@@ -224,16 +234,44 @@ class StarCraftBot(BotAI):
     # Engineering bay for upgrade research
     async def upgrade_units(self):
         if self.structures(UnitTypeId.ENGINEERINGBAY).ready.exists:
-            if self.units(UnitTypeId.MARINE).amount > self.units(UnitTypeId.MARAUDER).amount:
-                if self.can_afford(UpgradeId.TERRANINFANTRYWEAPONSLEVEL1) and not self.already_pending_upgrade(
-                        UpgradeId.TERRANINFANTRYWEAPONSLEVEL1):
+            if self.can_afford(UpgradeId.TERRANINFANTRYWEAPONSLEVEL1) and not self.already_pending_upgrade(
+                    UpgradeId.TERRANINFANTRYWEAPONSLEVEL1):
+                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
+                    UpgradeId.TERRANINFANTRYWEAPONSLEVEL1)
+            if self.can_afford(UpgradeId.TERRANINFANTRYARMORSLEVEL1) and not self.already_pending_upgrade(
+                    UpgradeId.TERRANINFANTRYARMORSLEVEL1):
+                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(                        UpgradeId.TERRANINFANTRYARMORSLEVEL1) 
+        if self.structures(UnitTypeId.ARMORY).ready.exists:
+            if self.can_afford(UpgradeId.TERRANVEHICLEARMORSLEVEL1) and not self.already_pending_upgrade(
+                        UpgradeId.TERRANVEHICLEARMORSLEVEL1):
                     self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
-                        UpgradeId.TERRANINFANTRYWEAPONSLEVEL1)
-            else:
-                if self.can_afford(UpgradeId.TERRANINFANTRYARMORSLEVEL1) and not self.already_pending_upgrade(
-                        UpgradeId.TERRANINFANTRYARMORSLEVEL1):
+                        UpgradeId.TERRANVEHICLEARMORSLEVEL1)
+            if self.can_afford(UpgradeId.TERRANSHIPWEAPONSLEVEL1) and not self.already_pending_upgrade(
+                        UpgradeId.TERRANSHIPWEAPONSLEVEL1):
                     self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
-                        UpgradeId.TERRANINFANTRYARMORSLEVEL1)
+                        UpgradeId.TERRANSHIPWEAPONSLEVEL1)
+            if self.can_afford(UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL1) and not self.already_pending_upgrade(
+                        UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL1):
+                    self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
+                        UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL1)
+            if self.can_afford(UpgradeId.TERRANVEHICLEANDSHIPWEAPONSLEVEL1) and not self.already_pending_upgrade(
+                        UpgradeId.TERRANVEHICLEANDSHIPWEAPONSLEVEL1):
+                    self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
+                        UpgradeId.TERRANVEHICLEANDSHIPWEAPONSLEVEL1)
+                    
+    async def upgrade_structures(self):
+       if self.structures(UnitTypeId.ENGINEERINGBAY).ready.exists:
+            if self.can_afford(UpgradeId.TERRANBUILDINGARMOR) and not self.already_pending_upgrade(
+                        UpgradeId.TERRANBUILDINGARMOR):
+                    self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
+                        UpgradeId.TERRANBUILDINGARMOR)   
+            if self.can_afford(UpgradeId.HISECAUTOTRACKING) and not self.already_pending_upgrade(
+                    UpgradeId.HISECAUTOTRACKING):
+                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
+                    UpgradeId.HISECAUTOTRACKING)   
+
+                    # orbital command
+                    # planatary fortress  
 
     # Develop the base's technology with tech labs
     async def build_techlab(self):
@@ -327,6 +365,21 @@ class StarCraftBot(BotAI):
                 # Otherwise, use the idle defensive squad
                 for unit in defensive_squad:
                     unit.attack(enemies.closest_to(location))
+
+    # async def manage_siege_tanks(self):
+    #     siege_mode_distance = 13
+    #     for tank in self.units(UnitTypeId.SIEGETANK).idle:
+    #         # Find the closest enemy
+    #         closest_enemy = self.known_enemy_units.closest_to(tank.position)
+
+    #         if closest_enemy and tank.distance_to(closest_enemy) <= siege_mode_distance:
+    #             # Siege up if not already in siege mode and enemy is within range
+    #             if not tank.has_buff(UnitTypeId.SIEGETANKSIEGED):
+    #                 await self.do(tank(UnitTypeId.OBSERVERSIEGEMODE))
+    #         else:
+    #             # Unsiege if sieged and no enemies are within the specified range
+    #             if tank.has_buff(UnitTypeId.SIEGETANKSIEGED):
+    #                 await self.do(tank(UnitTypeId.OVERSEERSIEGEMODE))
 
     # Calculate elapsed game time minutes
     @property
