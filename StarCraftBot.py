@@ -1,12 +1,37 @@
+import math
 import random
 
 from sc2 import maps
 from sc2.bot_ai import BotAI
 from sc2.data import Race, Difficulty
+from sc2.ids.ability_id import AbilityId
 from sc2.ids.unit_typeid import UnitTypeId
 from sc2.ids.upgrade_id import UpgradeId
 from sc2.main import run_game
 from sc2.player import Bot, Computer
+from sc2.position import Point2
+
+
+def defend_base(location, enemies, defensive_squad):
+    if enemies.exists:
+        # If the idle defensive squad is smaller than the minimum defense squad, get more units
+        if defensive_squad.amount > 5:
+            for unit in defensive_squad:
+                unit.attack(enemies.closest_to(location))
+
+
+def find_perimeter_position_for_bunker(center, min_distance):
+    # Attempt to find the position of a Bunker at the perimeter of the base
+    for _ in range(5):  # Try several times to get a suitable position
+        # Generate a random angle
+        angle = random.uniform(0, 2 * math.pi)
+        # Create a point at the perimeter using polar coordinates
+        position = Point2((math.cos(angle), math.sin(angle))) * min_distance + center
+
+        if position:
+            return position
+    # No suitable location found
+    return None
 
 
 class StarCraftBot(BotAI):
@@ -14,7 +39,7 @@ class StarCraftBot(BotAI):
         super().__init__()
 
         self.last_expansion_attempt = -999
-        self.EXPANSION_LIMIT = 2  # Max number of expansions
+        self.EXPANSION_LIMIT = 3  # Max number of expansions
         self.MINERALS_FOR_EXPANSION = 200  # Amount of minerals to be saved for expansion
         self.EXPANSION_COOLDOWN = 150  # Cooldown (game steps) between expansions to avoid over-expanding
 
@@ -26,7 +51,7 @@ class StarCraftBot(BotAI):
         if self.state.game_loop % (10 * 60 * 22.4) == 0:
             await self.send_scout()
 
-        if self.minutes_passed < 2:
+        if self.minutes_passed < 1:
             await self.manage_economy()
         else:
             # Try to defend if under attack, otherwise proceed with normal strategy
@@ -47,7 +72,7 @@ class StarCraftBot(BotAI):
         await self.build_supply_depots()
         await self.build_refinery()
         await self.build_engineering_bay()
-        await self.build_defensive_structures()
+        # await self.build_defensive_structures() not effective
         await self.build_techlab()
 
     # Method to manage army building and tech progression
@@ -58,28 +83,55 @@ class StarCraftBot(BotAI):
 
     # Method to manage attacks and army movement
     async def attacking_strategy(self):
-        attack_force_size = 36
-        offensive_units = {UnitTypeId.MARINE,
-                           UnitTypeId.REAPER,
-                           UnitTypeId.MARAUDER,
-                           UnitTypeId.MEDIVAC,
-                           UnitTypeId.BANSHEE,
-                           UnitTypeId.SIEGETANK}
-        total_offensive_units = sum(self.units(unit_type).amount for unit_type in offensive_units)
+        # Gather offensive units
+        army_units = self.units.filter(
+            lambda unit: unit.type_id in {UnitTypeId.MARINE, UnitTypeId.MARAUDER, UnitTypeId.REAPER,
+                                          UnitTypeId.SIEGETANK})
+        medivacs = self.units(UnitTypeId.MEDIVAC)
 
-        if total_offensive_units >= attack_force_size:
+        # Check army size to see if it's time to attack
+        attack_force_size = 42
+        if army_units.amount >= attack_force_size:
+            # Find a target
             target = self.find_target()
-            for unit_type in offensive_units:
-                for unit in self.units(unit_type).idle:
-                    unit.attack(target)
+            for unit in army_units.idle:
+                unit.attack(target)
+            for medivac in medivacs.idle:
+                # Follow the main army to provide healing
+                medivac.move(army_units.closest_to(target))
+        # Additional Medivac logic when no army units are left
+        elif medivacs.exists:
+            await self.retreat_medivacs(medivacs)
+
+    async def retreat_medivacs(self, medivacs):
+        # Find a safe location to retreat to, typically one of your own bases.
+        safe_location = self.start_location  # Fallback to the start location
+
+        # If there is a better safe location, like a base that is under less threat, use that instead.
+        # This simple version just returns to the start location.
+        for medivac in medivacs:
+            medivac.move(safe_location)
 
     def find_target(self):
+        # Check for visible enemy units or structures
         if self.enemy_units:
-            return random.choice(self.enemy_units)
-        elif self.enemy_structures:
-            return random.choice(self.enemy_structures)
-        else:
-            return random.choice(self.enemy_start_locations)
+            return random.choice(self.enemy_units).position
+        if self.enemy_structures:
+            return random.choice(self.enemy_structures).position
+
+        # If no enemy is visible, iterate over the potential expansion locations
+        for location in self.expansion_locations_list:
+            # Check if we've already explored this location
+            if self.is_visible(location):
+                # If there's nothing here, and we've seen it, move on
+                continue
+            # We haven't seen this place, so let's go take a look
+            return location
+
+        # As a last resort, if we have no visible enemy and all expansions have been scouted with nothing found,
+        # just return the enemy start location (it's likely incorrect if the game has gone on this long but better
+        # than nothing)
+        return random.choice(self.enemy_start_locations)
 
     # Send out the initial scout worker at the start of the game
     async def send_scout(self):
@@ -105,7 +157,7 @@ class StarCraftBot(BotAI):
 
     # Ensure we are not supply capped by building supply depots
     async def build_supply_depots(self):
-        if self.supply_left < 8 and not self.already_pending(UnitTypeId.SUPPLYDEPOT):
+        if self.supply_left < 10 and not self.already_pending(UnitTypeId.SUPPLYDEPOT):
             ccs = self.townhalls.ready
             if ccs.exists and self.can_afford(UnitTypeId.SUPPLYDEPOT):
                 await self.build_building_near(UnitTypeId.SUPPLYDEPOT, random.choice(ccs).position)
@@ -133,32 +185,41 @@ class StarCraftBot(BotAI):
                         if not err:
                             self.last_expansion_attempt = self.time
 
-    # TODO: -- Managing relocation of workers
     async def check_and_relocate_workers(self):
-        # Checking if some raw material sources are exhausted
         for cc in self.townhalls.ready:
+            # Are there still resources close to this Command Center to gather from?
             minerals_close = self.mineral_field.closer_than(10, cc)
-            if not minerals_close:
-                # If there are no more minerals near the command center, move the SCV
-                new_location = self.find_new_resource_location()
-                if new_location:
-                    for scv in self.workers.closer_than(10, cc):
+            geysers_close = self.vespene_geyser.closer_than(10, cc)
+            if minerals_close and geysers_close:
+                # There are still resources around, no need for relocation
+                continue
+
+            # Time to find a new mining location as current resources are depleted
+            new_location = await self.find_new_resource_location()
+            if new_location:
+                # Relocate the workers from depleted resources to the new location
+                for scv in self.workers.idle or self.workers.gathering:
+                    # Just relocate the workers that are too far from the available resources
+                    if not minerals_close and scv.is_carrying_minerals:
+                        scv.return_resource()
+                    elif not geysers_close and scv.is_carrying_vespene:
+                        scv.return_resource()
+                    else:
+                        # Otherwise, move to the new mineral patches
                         scv.move(new_location)
 
     async def find_new_resource_location(self):
-        # Finding the nearest unoccupied expansion
-        closest_expansion = None
-        min_distance = float('inf')
-        for expansion in self.expansion_locations_list:
-            # If the expansion is already occupied, skip it
-            if any(cc.position.is_same_as(expansion) for cc in self.townhalls):
-                continue
-            # Calculating distance from current position
-            distance = self.start_location.distance_to(expansion)
-            if distance < min_distance:
-                min_distance = distance
-                closest_expansion = expansion
-        return closest_expansion
+        # Sort expansions based on distance to current location and return the first one that is not taken
+        unoccupied_expansions = [expansion for expansion in self.expansion_locations_list if
+                                 not self.is_expansion_taken(expansion)]
+        if unoccupied_expansions:
+            return min(unoccupied_expansions, key=lambda expansion: self.start_location.distance_to(expansion))
+
+        # If no unoccupied expansions are available, then return None
+        return None
+
+    def is_expansion_taken(self, expansion):
+        return any(cc.position.is_same_as(expansion) for cc in self.townhalls)
 
     # Building refineries at each base to collect vespene gas
     async def build_refinery(self):
@@ -182,54 +243,49 @@ class StarCraftBot(BotAI):
 
     # Create and manage production buildings
     async def manage_production_buildings(self):
-        max_factories = 2
-        max_starports = 2 if self.minutes_passed < 10 else 3
         max_barracks = 3 if self.minutes_passed < 10 else 4
-        max_armories = 2
+        max_factories = 2 if self.minutes_passed < 10 else 3
+        max_starports = 2 if self.minutes_passed < 10 else 3
+        max_armories = 1
 
         if self.structures(UnitTypeId.SUPPLYDEPOT).ready.exists:
             # Create production buildings based on requirements for your chosen army composition
-            barracks_count = self.structures(UnitTypeId.BARRACKS).amount
-            factory_count = self.structures(UnitTypeId.FACTORY).amount
-            starport_count = self.structures(UnitTypeId.STARPORT).amount
-            armory_count = self.structures(UnitTypeId.ARMORY).amount
-
-            # Check if building is in progress
-            # barracks_in_progress = self.already_pending(UnitTypeId.BARRACKS)
-            # factory_in_progress = self.already_pending(UnitTypeId.FACTORY)
-            # starport_in_progress = self.already_pending(UnitTypeId.STARPORT)
-            # armory_in_progress = self.already_pending(UnitTypeId.ARMORY)
+            barracks_count = self.structures(UnitTypeId.BARRACKS).amount + self.already_pending(UnitTypeId.BARRACKS)
+            factory_count = self.structures(UnitTypeId.FACTORY).amount + self.already_pending(UnitTypeId.FACTORY)
+            starport_count = self.structures(UnitTypeId.STARPORT).amount + self.already_pending(UnitTypeId.STARPORT)
+            armory_count = self.structures(UnitTypeId.ARMORY).amount + self.already_pending(UnitTypeId.ARMORY)
 
             # Requirements for building production structures
             need_more_barracks = self.can_afford(UnitTypeId.BARRACKS) and barracks_count < max_barracks
             need_more_factories = self.can_afford(UnitTypeId.FACTORY) and factory_count < max_factories
             need_more_starports = self.can_afford(UnitTypeId.STARPORT) and starport_count < max_starports
+
             # TODO: -- NOT WORKING
-            need_armory = self.can_afford(
-                UnitTypeId.ARMORY) and armory_count < max_armories and factory_count > 0  # Build Armory after the first Factory
+            # Build Armory after the first Factory
+            need_armory = self.can_afford(UnitTypeId.ARMORY) and armory_count < max_armories and factory_count > 0
 
             # Logic to build Barracks, Factories, Starports, and an Armory
             if need_more_barracks:
-                await self.build_building_near(UnitTypeId.BARRACKS, self.start_location)
+                await self.build_building_near(UnitTypeId.BARRACKS, self.start_location.position)
 
             if need_more_factories and barracks_count > 0:  # Ensure we have a Barracks before building a Factory
-                await self.build_building_near(UnitTypeId.FACTORY, self.start_location)
+                await self.build_building_near(UnitTypeId.FACTORY, self.start_location.position)
 
             if need_more_starports and factory_count > 0:  # Ensure we have a Factory before building a Starport
-                await self.build_building_near(UnitTypeId.STARPORT, self.start_location)
+                await self.build_building_near(UnitTypeId.STARPORT, self.start_location.position)
 
             if need_armory:
-                await self.build_building_near(UnitTypeId.ARMORY, self.start_location)
+                await self.build_building_near(UnitTypeId.ARMORY, self.start_location.position)
 
     # Produce combat units from available barracks
     async def build_offensive_force(self):
         # Logic to determine the number of each type of unit to have at different stages of the game
-        marine_count_target = 12 if self.minutes_passed < 10 else 24
-        marauder_count_target = 12 if self.minutes_passed < 10 else 16
-        medivac_count_target = 2 if self.minutes_passed < 10 else 6
-        banshee_count_target = 2 if self.minutes_passed < 10 else 4
+        marine_count_target = 24
+        marauder_count_target = 8 if self.minutes_passed < 10 else 16
+        medivac_count_target = 2 if self.minutes_passed < 10 else 4
+        banshee_count_target = 2 if self.minutes_passed < 10 else 12
         reaper_count_target = 4 if self.minutes_passed < 5 else 0
-        siege_tank_count_target = 3 if self.minutes_passed < 10 else 8
+        siege_tank_count_target = 1 if self.minutes_passed < 10 else 12
 
         # Check if we have the required buildings before training units
         barracks_ready = self.structures(UnitTypeId.BARRACKS).ready.exists
@@ -272,43 +328,65 @@ class StarCraftBot(BotAI):
 
     # Engineering bay for upgrade research
     async def upgrade_units(self):
+        # Check for a ready Engineering Bay for infantry upgrades
         if self.structures(UnitTypeId.ENGINEERINGBAY).ready.exists:
-            if self.can_afford(UpgradeId.TERRANINFANTRYWEAPONSLEVEL1) and not self.already_pending_upgrade(
-                    UpgradeId.TERRANINFANTRYWEAPONSLEVEL1):
-                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
-                    UpgradeId.TERRANINFANTRYWEAPONSLEVEL1)
-            if self.can_afford(UpgradeId.TERRANINFANTRYARMORSLEVEL1) and not self.already_pending_upgrade(
-                    UpgradeId.TERRANINFANTRYARMORSLEVEL1):
-                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(UpgradeId.TERRANINFANTRYARMORSLEVEL1)
+            eb = self.structures(UnitTypeId.ENGINEERINGBAY).ready.first
+
+            # Trigger Infantry Weapon and Armor upgrades sequentially if we have the resources
+            await self.research_upgrade(UpgradeId.TERRANINFANTRYWEAPONSLEVEL1, eb)
+            await self.research_upgrade(UpgradeId.TERRANINFANTRYWEAPONSLEVEL2, eb,
+                                        required_structure_type=UnitTypeId.ARMORY)
+            await self.research_upgrade(UpgradeId.TERRANINFANTRYWEAPONSLEVEL3, eb,
+                                        required_structure_type=UnitTypeId.ARMORY)
+            await self.research_upgrade(UpgradeId.TERRANINFANTRYARMORSLEVEL1, eb)
+            await self.research_upgrade(UpgradeId.TERRANINFANTRYARMORSLEVEL2, eb,
+                                        required_structure_type=UnitTypeId.ARMORY)
+            await self.research_upgrade(UpgradeId.TERRANINFANTRYARMORSLEVEL3, eb,
+                                        required_structure_type=UnitTypeId.ARMORY)
+
+        # Check for a ready Armory for vehicle and ship upgrades
         if self.structures(UnitTypeId.ARMORY).ready.exists:
-            if self.can_afford(UpgradeId.TERRANVEHICLEARMORSLEVEL1) and not self.already_pending_upgrade(
-                    UpgradeId.TERRANVEHICLEARMORSLEVEL1):
-                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
-                    UpgradeId.TERRANVEHICLEARMORSLEVEL1)
-            if self.can_afford(UpgradeId.TERRANSHIPWEAPONSLEVEL1) and not self.already_pending_upgrade(
-                    UpgradeId.TERRANSHIPWEAPONSLEVEL1):
-                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
-                    UpgradeId.TERRANSHIPWEAPONSLEVEL1)
-            if self.can_afford(UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL1) and not self.already_pending_upgrade(
-                    UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL1):
-                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
-                    UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL1)
-            if self.can_afford(UpgradeId.TERRANVEHICLEANDSHIPWEAPONSLEVEL1) and not self.already_pending_upgrade(
-                    UpgradeId.TERRANVEHICLEANDSHIPWEAPONSLEVEL1):
-                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(
-                    UpgradeId.TERRANVEHICLEANDSHIPWEAPONSLEVEL1)
+            armory = self.structures(UnitTypeId.ARMORY).ready.first
+
+            # Trigger Vehicle and Ship Weapon and Armor upgrades sequentially if we have the resources
+            await self.research_upgrade(UpgradeId.TERRANVEHICLEWEAPONSLEVEL1, armory)
+            await self.research_upgrade(UpgradeId.TERRANVEHICLEWEAPONSLEVEL2, armory)
+            await self.research_upgrade(UpgradeId.TERRANVEHICLEWEAPONSLEVEL3, armory)
+            await self.research_upgrade(UpgradeId.TERRANSHIPWEAPONSLEVEL1, armory)
+            await self.research_upgrade(UpgradeId.TERRANSHIPWEAPONSLEVEL2, armory)
+            await self.research_upgrade(UpgradeId.TERRANSHIPWEAPONSLEVEL3, armory)
+            await self.research_upgrade(UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL1, armory)
+            await self.research_upgrade(UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL2, armory)
+            await self.research_upgrade(UpgradeId.TERRANVEHICLEANDSHIPARMORSLEVEL3, armory)
+
+    async def research_upgrade(self, upgrade_id, structure, required_structure_type=None):
+        # Check if the upgrade is not already being researched or completed, and if we can afford it
+        if not self.already_pending_upgrade(upgrade_id) and self.can_afford(upgrade_id):
+            # Check if a required structure type is needed before researching (e.g. Armory for higher levels)
+            if required_structure_type:
+                required_structure = self.structures(required_structure_type).ready
+                if not required_structure.exists:
+                    # Required structure not available, cannot research this upgrade yet
+                    return
+            # Issue the research order
+            structure.research(upgrade_id)
 
     async def upgrade_structures(self):
+        # Engineering Bay upgrades for structures
         if self.structures(UnitTypeId.ENGINEERINGBAY).ready.exists:
-            if self.can_afford(UpgradeId.TERRANBUILDINGARMOR) and not self.already_pending_upgrade(
-                    UpgradeId.TERRANBUILDINGARMOR):
-                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(UpgradeId.TERRANBUILDINGARMOR)
-            if self.can_afford(UpgradeId.HISECAUTOTRACKING) and not self.already_pending_upgrade(
-                    UpgradeId.HISECAUTOTRACKING):
-                self.structures(UnitTypeId.ENGINEERINGBAY).ready.first.research(UpgradeId.HISECAUTOTRACKING)
+            eb = self.structures(UnitTypeId.ENGINEERINGBAY).ready.first
+            await self.research_upgrade(UpgradeId.HISECAUTOTRACKING, eb)
+            await self.research_upgrade(UpgradeId.TERRANBUILDINGARMOR, eb)
 
-                # orbital command
-                # planatary fortress
+        # Command Center upgrades to Orbital Command or Planetary Fortress
+        for cc in self.townhalls(UnitTypeId.COMMANDCENTER).idle:
+            # If the required upgrades are finished or not necessary, consider upgrading to Orbital Command or
+            # Planetary Fortress
+            if self.can_afford(UnitTypeId.ORBITALCOMMAND) and not cc.has_add_on:
+                cc(AbilityId.UPGRADETOORBITAL_ORBITALCOMMAND)
+
+            if self.can_afford(UnitTypeId.PLANETARYFORTRESS) and not cc.has_add_on:
+                cc(AbilityId.UPGRADETOPLANETARYFORTRESS_PLANETARYFORTRESS)
 
     # Develop the base's technology with tech labs
     async def build_techlab(self):
@@ -332,11 +410,11 @@ class StarCraftBot(BotAI):
                     starport.build(UnitTypeId.STARPORTTECHLAB)
 
     # Use established position logic to prevent unit pathing blockage
-    async def build_building_near(self, building_type, near_structure, max_distance=25):
+    async def build_building_near(self, building_type, position, max_distance=25):
         # Note that try...except blocks are used to handle the situation where the bot may be unable to find a
         # valid build location (e.g. all locations are blocked or currently occupied).
         try:
-            location = await self.find_placement(building_type, near_structure.position, max_distance=max_distance)
+            location = await self.find_placement(building_type, position, max_distance=max_distance)
             if location:
                 await self.build(building_type, location)
                 return True  # Successfully found a location and issued a build command
@@ -349,46 +427,34 @@ class StarCraftBot(BotAI):
         if not self.structures(UnitTypeId.ENGINEERINGBAY).exists:
             # Ensure you have enough resources before trying to build
             if self.can_afford(UnitTypeId.ENGINEERINGBAY):
-                await self.build_building_near(UnitTypeId.ENGINEERINGBAY, self.start_location)
+                await self.build_building_near(UnitTypeId.ENGINEERINGBAY, self.start_location.position)
 
     async def build_defensive_structures(self):
-        # if self.structures(UnitTypeId.ENGINEERINGBAY).ready.exists:
-        #     for cc in self.townhalls.ready:
-        #         await self.build_missile_turrets(cc)
-
         for cc in self.townhalls.ready:
             await self.build_bunkers(cc)
 
-    # TODO: -- NOT WORKING
-    async def build_missile_turrets(self, cc):
-        if self.structures(UnitTypeId.BUNKER).closer_than(25, cc).amount < 2 and self.can_afford(
-                UnitTypeId.MISSILETURRET):
-            await self.build_building_near(UnitTypeId.MISSILETURRET, cc.position)
-
     async def build_bunkers(self, cc):
-        if self.structures(UnitTypeId.BUNKER).closer_than(25, cc).amount < 2 and self.can_afford(UnitTypeId.BUNKER):
-            await self.build_building_near(UnitTypeId.BUNKER, cc.position)
+        # Desired number of Bunkers around each base
+        desired_bunker_count = 2
+        edge_distance = 15
+
+        # Check if we can afford a Bunker and have less than the desired count
+        if self.can_afford(UnitTypeId.BUNKER) and self.structures(UnitTypeId.BUNKER).closer_than(
+                edge_distance, cc).amount < desired_bunker_count:
+            # Find placement position around the base outside the mineral line
+            position = find_perimeter_position_for_bunker(cc.position, edge_distance)
+            if position:
+                # If a valid position is found, try to build a Bunker there
+                await self.build_building_near(UnitTypeId.BUNKER, position, max_distance=edge_distance)
 
     async def defend(self):
         for th in self.townhalls:
             enemies = self.enemy_units.closer_than(15, th.position)
             if enemies.exists:
                 defensive_squad = self.units.idle
-                self.defend_base(th, enemies, defensive_squad)
+                defend_base(th, enemies, defensive_squad)
                 return True
         return False
-
-    def defend_base(self, location, enemies, defensive_squad):
-        if enemies.exists:
-            # If the idle defensive squad is smaller than the minimum defense squad, get more units
-            if defensive_squad.amount < 10:
-                backup_units = defensive_squad.prefer_idle.idle  # Get both idle and engaged units close to base
-                for unit in backup_units:
-                    unit.attack(enemies.closest_to(location))
-            else:
-                # Otherwise, use the idle defensive squad
-                for unit in defensive_squad:
-                    unit.attack(enemies.closest_to(location))
 
     # Calculate elapsed game time minutes
     @property
@@ -399,6 +465,6 @@ class StarCraftBot(BotAI):
 # Run the game
 run_game(
     maps.get("sc2-ai-cup-2022"),
-    [Bot(Race.Terran, StarCraftBot()), Computer(Race.Terran, Difficulty.Medium)],
+    [Bot(Race.Terran, StarCraftBot()), Computer(Race.Terran, Difficulty.Hard)],
     realtime=False,
 )
